@@ -51,4 +51,9 @@ public class AthleteController {
     public List<Notification> getNotifications() {
         return athleteService.getNotifications(CURRENT_USER_ID);
     }
+
+    @GetMapping
+    public List<Athlete> getAllAthletes() {
+        return athleteService.getAllAthletes();
+    }
 }

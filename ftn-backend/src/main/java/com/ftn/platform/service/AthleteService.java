@@ -58,4 +58,8 @@ public class AthleteService {
     public List<CompetitionResult> getResults(Long athleteId) {
         return resultRepository.findByAthleteId(athleteId);
     }
+
+    public List<Athlete> getAllAthletes() {
+        return athleteRepository.findAll();
+    }
 }

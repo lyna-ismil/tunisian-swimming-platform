@@ -13,6 +13,7 @@ import java.util.List;
 @Repository
 public interface SponsorshipRequestRepository extends JpaRepository<SponsorshipRequest, String> {
     List<SponsorshipRequest> findByStatus(RequestStatus status);
+    List<SponsorshipRequest> findBySponsorNameAndStatus(String sponsorName, RequestStatus status);
     List<SponsorshipRequest> findByApplicantContainingIgnoreCaseOrSponsorNameContainingIgnoreCase(String applicant, String sponsor);
     long countByStatus(RequestStatus status);
 

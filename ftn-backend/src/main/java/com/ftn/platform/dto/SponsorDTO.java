@@ -1,5 +1,7 @@
 package com.ftn.platform.dto;
 
+import jakarta.validation.constraints.PositiveOrZero;
+
 import java.util.List;
 
 public record SponsorDTO(
@@ -14,7 +16,8 @@ public record SponsorDTO(
         Integer athletesCount,
         Integer competitionsCount,
         String startDate,
-        Double totalValue,
+        String endDate,
+        @PositiveOrZero(message = "totalValue must be greater than or equal to 0") Double totalValue,
         List<String> preferredDisciplines
 ) {
 }

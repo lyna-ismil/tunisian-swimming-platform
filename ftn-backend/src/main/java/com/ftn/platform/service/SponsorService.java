@@ -5,10 +5,14 @@ import com.ftn.platform.entity.Sponsor;
 import com.ftn.platform.entity.SponsorStatus;
 import com.ftn.platform.repository.SponsorRepository;
 import com.ftn.platform.repository.SponsorshipRequestRepository;
+import com.ftn.platform.repository.SponsorContractRepository;
+import com.ftn.platform.entity.ContractType;
+import com.ftn.platform.entity.ContractStatus;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.format.TextStyle;
 import java.util.ArrayList;
@@ -24,6 +28,7 @@ public class SponsorService {
 
     private final SponsorRepository sponsorRepository;
     private final SponsorshipRequestRepository requestRepository;
+    private final SponsorContractRepository contractRepository;
 
     public List<SponsorDTO> getAllSponsors() {
         return sponsorRepository.findAll().stream().map(this::mapToDTO).collect(Collectors.toList());
@@ -37,6 +42,9 @@ public class SponsorService {
 
     @Transactional
     public SponsorDTO createSponsor(SponsorDTO dto) {
+        if (dto.totalValue() != null && dto.totalValue() < 0) {
+            throw new IllegalArgumentException("Sponsor total value must be greater than or equal to 0");
+        }
         Sponsor sponsor = mapToEntity(dto);
         return mapToDTO(sponsorRepository.save(sponsor));
     }
@@ -53,9 +61,51 @@ public class SponsorService {
         existing.setWebsite(dto.website());
         existing.setContactEmail(dto.contactEmail());
         existing.setStatus(SponsorStatus.valueOf(dto.status().toUpperCase()));
-        // Note: athletesCount, competitionsCount, totalValue are updated separately when requests are approved
         
-        return mapToDTO(sponsorRepository.save(existing));
+        if (dto.startDate() != null && !dto.startDate().isBlank()) {
+            existing.setStartDate(LocalDate.parse(dto.startDate()));
+        } else {
+            existing.setStartDate(null);
+        }
+        
+        if (dto.endDate() != null && !dto.endDate().isBlank()) {
+            existing.setEndDate(LocalDate.parse(dto.endDate()));
+        } else {
+            existing.setEndDate(null);
+        }
+        
+        if (dto.totalValue() != null) {
+            if (dto.totalValue() < 0) {
+                throw new IllegalArgumentException("Sponsor total value must be greater than or equal to 0");
+            }
+            existing.setTotalValue(dto.totalValue());
+        }
+        if (dto.athletesCount() != null) existing.setAthletesCount(dto.athletesCount());
+        if (dto.competitionsCount() != null) existing.setCompetitionsCount(dto.competitionsCount());
+        if (dto.preferredDisciplines() != null) existing.setPreferredDisciplines(toJson(dto.preferredDisciplines()));
+        
+        Sponsor saved = sponsorRepository.save(existing);
+        return mapToDTO(saved);
+    }
+
+    @Transactional
+    public void recalculateSponsorStats(Long sponsorId) {
+        Sponsor sponsor = sponsorRepository.findById(sponsorId).orElse(null);
+        if (sponsor == null) return;
+        
+        BigDecimal totalValue = contractRepository.sumActiveContractValues(sponsorId);
+        long athleteCount = contractRepository.countActiveContractsByType(sponsorId, ContractType.ATHLETE);
+        long competitionCount = contractRepository.countActiveContractsByType(sponsorId, ContractType.COMPETITION);
+
+        if (totalValue != null && totalValue.compareTo(BigDecimal.ZERO) > 0) {
+            sponsor.setTotalValue(totalValue.doubleValue());
+        } else if (sponsor.getTotalValue() == null) {
+            sponsor.setTotalValue(0.0);
+        }
+        
+        sponsor.setAthletesCount((int) athleteCount);
+        sponsor.setCompetitionsCount((int) competitionCount);
+        sponsorRepository.save(sponsor);
     }
 
     @Transactional
@@ -69,12 +119,14 @@ public class SponsorService {
         long activeSponsorships = all.stream().filter(s -> s.getStatus() == SponsorStatus.ACTIVE).count();
         double totalValue = all.stream().mapToDouble(Sponsor::getTotalValue).sum();
         int sponsoredAthletes = all.stream().mapToInt(Sponsor::getAthletesCount).sum();
+        long activeContractsCount = contractRepository.countByStatus(ContractStatus.ACTIVE);
 
         Map<String, Object> stats = new HashMap<>();
         stats.put("totalSponsors", totalSponsors);
         stats.put("activeSponsorships", activeSponsorships);
         stats.put("totalValue", totalValue);
         stats.put("sponsoredAthletes", sponsoredAthletes);
+        stats.put("activeContractsCount", activeContractsCount);
         return stats;
     }
 
@@ -139,6 +191,7 @@ public class SponsorService {
                 s.getWebsite(), s.getContactEmail(), s.getStatus().name(),
                 s.getAthletesCount(), s.getCompetitionsCount(),
                 s.getStartDate() != null ? s.getStartDate().toString() : null,
+                s.getEndDate() != null ? s.getEndDate().toString() : null,
                 s.getTotalValue(),
                 s.getPreferredDisciplines() != null ? parseStringList(s.getPreferredDisciplines()) : List.of()
         );

@@ -23,6 +23,7 @@ public class SponsorshipRequestService {
 
     private final SponsorshipRequestRepository requestRepository;
     private final SponsorRepository sponsorRepository;
+    private final SponsorService sponsorService;
     private final AtomicInteger counter = new AtomicInteger(100);
 
     public List<SponsorshipRequestDTO> getRequests(String status, String type, String priority, String search) {
@@ -73,13 +74,14 @@ public class SponsorshipRequestService {
         RequestStatus newStatus = RequestStatus.valueOf(dto.status().toUpperCase());
         
         request.setStatus(newStatus);
+        SponsorshipRequest saved = requestRepository.save(request);
         
-        // If transitioning to APPROVED, increment sponsor stats
-        if (oldStatus != RequestStatus.APPROVED && newStatus == RequestStatus.APPROVED) {
-            updateSponsorStatsForApproval(request);
+        // Always trigger recalculation on status change
+        if (oldStatus != newStatus) {
+            updateSponsorStatsForApproval(saved);
         }
         
-        return mapToDTO(requestRepository.save(request));
+        return mapToDTO(saved);
     }
 
     private void updateSponsorStatsForApproval(SponsorshipRequest request) {
@@ -87,20 +89,15 @@ public class SponsorshipRequestService {
         sponsorRepository.findAll().stream()
                 .filter(s -> s.getName().equalsIgnoreCase(request.getSponsorName()))
                 .findFirst()
-                .ifPresent(sponsor -> {
-                    if ("ATHLETE".equalsIgnoreCase(request.getType())) {
-                        sponsor.setAthletesCount(sponsor.getAthletesCount() + 1);
-                    } else if ("EVENT".equalsIgnoreCase(request.getType()) || "CLUB".equalsIgnoreCase(request.getType())) {
-                        sponsor.setCompetitionsCount(sponsor.getCompetitionsCount() + 1);
-                    }
-                    sponsor.setTotalValue(sponsor.getTotalValue() + request.getAmount());
-                    sponsorRepository.save(sponsor);
-                });
+                .ifPresent(sponsor -> sponsorService.recalculateSponsorStats(sponsor.getId()));
     }
 
     @Transactional
     public void deleteRequest(String id) {
-        requestRepository.deleteById(id);
+        requestRepository.findById(id).ifPresent(request -> {
+            requestRepository.deleteById(id);
+            updateSponsorStatsForApproval(request);
+        });
     }
 
     public Map<String, Object> getStats() {

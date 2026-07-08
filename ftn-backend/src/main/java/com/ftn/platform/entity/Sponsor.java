@@ -52,6 +52,8 @@ public class Sponsor {
 
     private LocalDate startDate;
 
+    private LocalDate endDate;
+
     @Builder.Default
     private Double totalValue = 0.0;
 }

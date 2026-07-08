@@ -2,6 +2,7 @@ package com.ftn.platform.entity;
 
 import jakarta.persistence.*;
 import lombok.*;
+import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "athlete_match")
@@ -48,6 +49,22 @@ public class AthleteMatch {
 
     @Column(columnDefinition = "TEXT")
     private String keyFactorsJson;
+
+    private String verdict;
+
+    @Column(columnDefinition = "TEXT")
+    private String strengthsJson;
+
+    @Column(columnDefinition = "TEXT")
+    private String weaknessesJson;
+
+    @Column(columnDefinition = "TEXT")
+    private String potentialRoiText;
+
+    @Column(columnDefinition = "TEXT")
+    private String audienceOverlapText;
+
+    private LocalDateTime evaluationDate;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)

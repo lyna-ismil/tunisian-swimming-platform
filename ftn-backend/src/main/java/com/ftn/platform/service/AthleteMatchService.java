@@ -3,8 +3,8 @@ package com.ftn.platform.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ftn.platform.dto.AthleteMatchDTO;
-import com.ftn.platform.dto.MatchGenerationRequestDTO;
-import com.ftn.platform.dto.MatchGenerationResponseDTO;
+import com.ftn.platform.dto.EvaluateMatchRequestDTO;
+import com.ftn.platform.dto.MatchEvaluationResponseDTO;
 import com.ftn.platform.entity.AthleteMatch;
 import com.ftn.platform.entity.MatchStatus;
 import com.ftn.platform.repository.AthleteMatchRepository;
@@ -63,17 +63,8 @@ public class AthleteMatchService {
     }
 
     @Transactional
-    public MatchGenerationResponseDTO generateMatches(MatchGenerationRequestDTO request) {
-        return smartMatchingService.generateMatches(request);
-    }
-
-    @Transactional
-    public MatchGenerationResponseDTO regenerateMatches() {
-        return smartMatchingService.regenerateMatches();
-    }
-
-    public List<AthleteMatchDTO> getSmartSuggestions(Long sponsorId) {
-        return smartMatchingService.getSmartSuggestions(sponsorId);
+    public MatchEvaluationResponseDTO evaluateMatch(EvaluateMatchRequestDTO request) {
+        return smartMatchingService.evaluateAthleteForSponsor(request.sponsorId(), request.athleteId());
     }
 
     private AthleteMatchDTO mapToDTO(AthleteMatch m) {

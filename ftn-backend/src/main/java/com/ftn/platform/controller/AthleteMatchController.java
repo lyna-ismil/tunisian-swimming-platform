@@ -1,9 +1,10 @@
 package com.ftn.platform.controller;
 
 import com.ftn.platform.dto.AthleteMatchDTO;
-import com.ftn.platform.dto.MatchGenerationRequestDTO;
-import com.ftn.platform.dto.MatchGenerationResponseDTO;
+import com.ftn.platform.dto.EvaluateMatchRequestDTO;
+import com.ftn.platform.dto.MatchEvaluationResponseDTO;
 import com.ftn.platform.service.AthleteMatchService;
+import com.ftn.platform.service.SmartMatchingService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
@@ -15,6 +16,7 @@ import java.util.List;
 public class AthleteMatchController {
 
     private final AthleteMatchService matchService;
+    private final SmartMatchingService smartMatchingService;
 
     @GetMapping
     public List<AthleteMatchDTO> getAllMatches() {
@@ -41,18 +43,19 @@ public class AthleteMatchController {
         matchService.deleteMatch(id);
     }
 
-    @PostMapping("/generate")
-    public MatchGenerationResponseDTO generateMatches(@RequestBody(required = false) MatchGenerationRequestDTO request) {
-        return matchService.generateMatches(request);
+    @PostMapping("/evaluate")
+    public MatchEvaluationResponseDTO evaluateMatch(@RequestBody EvaluateMatchRequestDTO request) {
+        return matchService.evaluateMatch(request);
     }
 
-    @PostMapping("/regenerate")
-    public MatchGenerationResponseDTO regenerateMatches() {
-        return matchService.regenerateMatches();
-    }
-
-    @GetMapping("/smart-suggestions")
-    public List<AthleteMatchDTO> getSmartSuggestions(@RequestParam Long sponsorId) {
-        return matchService.getSmartSuggestions(sponsorId);
+    @GetMapping("/athletes")
+    public List<SmartMatchingService.AthleteProfile> getAthletePool(
+            @RequestParam(required = false) String discipline,
+            @RequestParam(required = false) Integer ageMin,
+            @RequestParam(required = false) Integer ageMax,
+            @RequestParam(required = false) Integer rankMax,
+            @RequestParam(required = false) String gender,
+            @RequestParam(required = false) String club) {
+        return smartMatchingService.getAthletePool(discipline, ageMin, ageMax, rankMax, gender, club);
     }
 }

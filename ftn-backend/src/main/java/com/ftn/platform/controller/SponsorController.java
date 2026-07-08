@@ -2,6 +2,7 @@ package com.ftn.platform.controller;
 
 import com.ftn.platform.dto.SponsorDTO;
 import com.ftn.platform.service.SponsorService;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
@@ -26,12 +27,12 @@ public class SponsorController {
     }
 
     @PostMapping
-    public SponsorDTO createSponsor(@RequestBody SponsorDTO sponsorDTO) {
+    public SponsorDTO createSponsor(@Valid @RequestBody SponsorDTO sponsorDTO) {
         return sponsorService.createSponsor(sponsorDTO);
     }
 
     @PutMapping("/{id}")
-    public SponsorDTO updateSponsor(@PathVariable Long id, @RequestBody SponsorDTO sponsorDTO) {
+    public SponsorDTO updateSponsor(@PathVariable Long id, @Valid @RequestBody SponsorDTO sponsorDTO) {
         return sponsorService.updateSponsor(id, sponsorDTO);
     }
 

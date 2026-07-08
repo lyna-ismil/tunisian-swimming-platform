@@ -3,12 +3,9 @@ package com.ftn.platform.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.ftn.platform.dto.AthleteMatchDTO;
-import com.ftn.platform.dto.MatchGenerationRequestDTO;
-import com.ftn.platform.dto.MatchGenerationResponseDTO;
+import com.ftn.platform.dto.MatchEvaluationResponseDTO;
 import com.ftn.platform.entity.*;
 import com.ftn.platform.exception.EntityNotFoundException;
-import com.ftn.platform.exception.RateLimitExceededException;
 import com.ftn.platform.repository.*;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
@@ -16,35 +13,71 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.time.Duration;
-import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.LocalDate;
 import java.time.Period;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class SmartMatchingService {
 
-    private static final int DEFAULT_MAX_MATCHES_PER_SPONSOR = 5;
-    private static final Duration RATE_LIMIT_WINDOW = Duration.ofMinutes(1);
-    private static final String SYSTEM_PROMPT = "You are the FTN Smart Matching Engine. Analyze the athlete and sponsor profiles below. Respond ONLY in this JSON format: {\"matchScore\":0-100,\"reason\":\"2-3 sentence explanation of why this is a good/poor match\",\"confidence\":\"HIGH|MEDIUM|LOW\",\"keyFactors\":[\"factor 1\",\"factor 2\",\"factor 3\"]}. Consider performance alignment, brand fit, geographic relevance, historical sponsorship success, and financial viability.";
+    private static final String SYSTEM_PROMPT = """
+            You are the FTN Smart Sponsorship Analyst. Your job is to evaluate how well a specific athlete fits a specific sponsor.
+            
+            ATHLETE PROFILE:
+            %s
+            
+            SPONSOR PROFILE:
+            %s
+            
+            SPONSOR PREFERENCES:
+            %s
+            
+            RULE-BASED SCORE: %d
+            
+            Respond ONLY with valid JSON in this exact structure:
+            {
+              "matchScore": [0-100, can differ slightly from rule-based score based on nuance],
+              "verdict": "Strong Fit" | "Moderate Fit" | "Poor Fit",
+              "confidence": "HIGH" | "MEDIUM" | "LOW",
+              "explanation": "2-3 sentences",
+              "strengths": ["3-5 bullet points"],
+              "weaknesses": ["2-4 bullet points, or empty array"],
+              "potentialROI": {
+                "projectedValue": [number],
+                "currency": "TND",
+                "explanation": "2 sentences"
+              },
+              "audienceOverlap": {
+                "score": [0-100],
+                "explanation": "2 sentences"
+              },
+              "keyFactors": [
+                {"name": "...", "score": 0-100, "weight": 0.0}
+              ]
+            }
+            
+            Guidelines:
+            - Be specific. Reference actual athlete achievements and sponsor goals.
+            - If you lack data, infer reasonably and flag confidence as MEDIUM or LOW.
+            - Use numbers and percentages where possible.
+            - Keep explanations concise but insightful.
+            - Strengths should outweigh weaknesses for scores >75.
+            """;
 
     private final AthleteRepository athleteRepository;
     private final RankingRepository rankingRepository;
@@ -56,141 +89,160 @@ public class SmartMatchingService {
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper objectMapper;
 
-    @Value("${groq.api.key}")
-    private String apiKey;
+    private final String apiKey;
+    private final String model;
+    private final String groqUrl;
+    private final WebClient groqClient;
 
-    @Value("${groq.api.model}")
-    private String model;
-
-    @Value("${groq.api.url:https://api.groq.com/openai/v1}")
-    private String groqUrl;
-
-    private final Map<Long, Instant> sponsorGenerationTimestamps = new ConcurrentHashMap<>();
-    private WebClient groqClient;
-
-    @PostConstruct
-    void init() {
+    public SmartMatchingService(
+            AthleteRepository athleteRepository,
+            RankingRepository rankingRepository,
+            CompetitionResultRepository resultRepository,
+            LicenseRepository licenseRepository,
+            SponsorRepository sponsorRepository,
+            SponsorPreferencesRepository sponsorPreferencesRepository,
+            AthleteMatchRepository matchRepository,
+            WebClient.Builder webClientBuilder,
+            ObjectMapper objectMapper,
+            @Value("${groq.api.key}") String apiKey,
+            @Value("${groq.api.model}") String model,
+            @Value("${groq.api.url:https://api.groq.com/openai/v1}") String groqUrl) {
+        this.athleteRepository = athleteRepository;
+        this.rankingRepository = rankingRepository;
+        this.resultRepository = resultRepository;
+        this.licenseRepository = licenseRepository;
+        this.sponsorRepository = sponsorRepository;
+        this.sponsorPreferencesRepository = sponsorPreferencesRepository;
+        this.matchRepository = matchRepository;
+        this.webClientBuilder = webClientBuilder;
+        this.objectMapper = objectMapper;
+        this.apiKey = apiKey;
+        this.model = model;
+        this.groqUrl = groqUrl;
         this.groqClient = webClientBuilder.baseUrl(groqUrl).build();
     }
 
-    @Transactional
-    public MatchGenerationResponseDTO generateMatches(MatchGenerationRequestDTO request) {
-        List<Sponsor> sponsors = resolveSponsors(request);
-        int maxMatches = resolveMaxMatches(request);
-        boolean persist = request == null || request.persist() == null || request.persist();
-
-        if (persist) {
-            archiveProposedMatchesForSponsors(sponsors);
-        }
-
-        List<AthleteMatchDTO> generatedMatches = new ArrayList<>();
-        for (Sponsor sponsor : sponsors) {
-            generatedMatches.addAll(generateMatchesForSponsorInternal(sponsor, maxMatches, persist));
-        }
-
-        return new MatchGenerationResponseDTO(
-                sponsors.size(),
-                generatedMatches.size(),
-                generatedMatches,
-                persist ? "Generated and saved smart matches." : "Generated smart match preview."
-        );
-    }
-
-    @Transactional
-    public MatchGenerationResponseDTO regenerateMatches() {
-        archiveProposedMatches();
-        return generateMatches(new MatchGenerationRequestDTO(null, DEFAULT_MAX_MATCHES_PER_SPONSOR, true));
-    }
-
-    @Transactional(readOnly = true)
-    public List<AthleteMatchDTO> getSmartSuggestions(Long sponsorId) {
-        Sponsor sponsor = sponsorRepository.findById(sponsorId)
-                .orElseThrow(() -> new EntityNotFoundException("Sponsor not found with id: " + sponsorId));
-        return generateMatchesForSponsorInternal(sponsor, DEFAULT_MAX_MATCHES_PER_SPONSOR, false);
-    }
-
-    @Scheduled(cron = "0 0 2 ? * MON")
-    public void regenerateMatchesWeekly() {
-        try {
-            MatchGenerationResponseDTO response = regenerateMatches();
-            log.info("Weekly smart matching job completed: {} sponsors, {} matches", response.sponsorsProcessed(), response.matchesGenerated());
-        } catch (Exception ex) {
-            log.error("Weekly smart matching job failed", ex);
-        }
-    }
-
-    private List<Sponsor> resolveSponsors(MatchGenerationRequestDTO request) {
-        if (request != null && request.sponsorIds() != null && !request.sponsorIds().isEmpty()) {
-            return sponsorRepository.findAllById(request.sponsorIds());
-        }
-        return sponsorRepository.findByStatus(SponsorStatus.ACTIVE);
-    }
-
-    private int resolveMaxMatches(MatchGenerationRequestDTO request) {
-        if (request == null || request.maxMatchesPerSponsor() == null || request.maxMatchesPerSponsor() < 1) {
-            return DEFAULT_MAX_MATCHES_PER_SPONSOR;
-        }
-        return request.maxMatchesPerSponsor();
-    }
-
-    private List<AthleteMatchDTO> generateMatchesForSponsorInternal(Sponsor sponsor, int maxMatches, boolean persist) {
-        ensureGenerationAllowed(sponsor.getId());
-
-        SponsorPreferences preferences = sponsorPreferencesRepository.findBySponsorId(sponsor.getId()).orElse(null);
-        SponsorProfile sponsorProfile = buildSponsorProfile(sponsor, preferences);
-        List<CandidateMatch> candidates = buildCandidates(sponsorProfile, preferences, maxMatches);
-
-        List<AthleteMatchDTO> generated = new ArrayList<>();
-        for (CandidateMatch candidate : candidates) {
-            AiMatchResponse aiResponse = generateAiMatch(candidate.athleteProfile(), sponsorProfile);
-            if (aiResponse == null) {
-                aiResponse = buildFallbackResponse(candidate, sponsorProfile);
-            }
-
-            AthleteMatch match = buildMatchEntity(candidate.athleteProfile(), sponsorProfile, aiResponse);
-            if (persist) {
-                match = matchRepository.save(match);
-            }
-            generated.add(mapToDTO(match));
-        }
-
-        return generated;
-    }
-
-    private List<CandidateMatch> buildCandidates(SponsorProfile sponsorProfile, SponsorPreferences preferences, int maxMatches) {
-        List<AthleteProfile> athletes = buildAthleteProfiles();
-        return athletes.stream()
-                .map(athlete -> new CandidateMatch(athlete, calculateFallbackScore(athlete, sponsorProfile, preferences)))
-                .filter(candidate -> isEligible(candidate.athleteProfile(), preferences))
-                .sorted(Comparator.comparingInt(CandidateMatch::ruleScore).reversed())
-                .limit(Math.max(maxMatches * 2L, maxMatches))
+    public List<AthleteProfile> getAthletePool(String discipline, Integer ageMin, Integer ageMax, Integer rankMax, String gender, String club) {
+        return buildAthleteProfiles().stream()
+                .filter(a -> discipline == null || discipline.equalsIgnoreCase(a.discipline()))
+                .filter(a -> ageMin == null || (a.age() != null && a.age() >= ageMin))
+                .filter(a -> ageMax == null || (a.age() != null && a.age() <= ageMax))
+                .filter(a -> rankMax == null || (a.currentRank() != null && a.currentRank() <= rankMax))
+                .filter(a -> gender == null || gender.equalsIgnoreCase(a.gender()))
+                .filter(a -> club == null || (a.clubAffiliation() != null && a.clubAffiliation().toLowerCase().contains(club.toLowerCase())))
                 .collect(Collectors.toList());
     }
 
-    private boolean isEligible(AthleteProfile athlete, SponsorPreferences preferences) {
-        if (preferences == null) {
-            return true;
-        }
+    @Transactional
+    public MatchEvaluationResponseDTO evaluateAthleteForSponsor(Long sponsorId, Long athleteId) {
+        List<AthleteMatch> existingMatches = matchRepository.findBySponsorId(sponsorId);
+        AthleteMatch existingMatch = existingMatches.stream()
+                .filter(m -> m.getAthlete() != null && m.getAthlete().getId().equals(athleteId))
+                .findFirst()
+                .orElse(null);
 
-        if (preferences.getTargetGender() != null && !preferences.getTargetGender().isBlank()) {
-            if (athlete.gender() == null || !preferences.getTargetGender().equalsIgnoreCase(athlete.gender())) {
-                return false;
+        if (existingMatch != null && existingMatch.getEvaluationDate() != null) {
+            if (existingMatch.getEvaluationDate().isAfter(LocalDateTime.now().minusHours(24))) {
+                return mapToResponseDTO(existingMatch);
             }
         }
 
-        if (preferences.getMaxAthleteAge() != null && athlete.age() != null && athlete.age() > preferences.getMaxAthleteAge()) {
-            return false;
+        Sponsor sponsor = sponsorRepository.findById(sponsorId)
+                .orElseThrow(() -> new EntityNotFoundException("Sponsor not found"));
+        Athlete athlete = athleteRepository.findById(athleteId)
+                .orElseThrow(() -> new EntityNotFoundException("Athlete not found"));
+
+        SponsorPreferences preferences = sponsorPreferencesRepository.findBySponsorId(sponsorId).orElse(null);
+        SponsorProfile sponsorProfile = buildSponsorProfile(sponsor, preferences);
+        AthleteProfile athleteProfile = buildAthleteProfile(athlete);
+        
+        int ruleScore = calculateFallbackScore(athleteProfile, sponsorProfile, preferences);
+        
+        // Note: AI call is inside @Transactional. Consider extracting out to avoid holding DB connections.
+        AiMatchResponse aiResponse = generateAiMatch(athleteProfile, sponsorProfile, preferences, ruleScore);
+        if (aiResponse == null) {
+            aiResponse = buildFallbackResponse(ruleScore, athleteProfile, sponsorProfile);
         }
 
-        if (preferences.getMinRankPosition() != null && athlete.currentRank() != null && athlete.currentRank() > preferences.getMinRankPosition()) {
-            return false;
+        AthleteMatch match = existingMatch != null ? existingMatch : new AthleteMatch();
+        match.setAthlete(athlete);
+        match.setSponsor(sponsor);
+        match.setAthleteName(athleteProfile.name());
+        match.setAthletePhotoUrl(athleteProfile.photoUrl());
+        match.setDiscipline(athleteProfile.discipline());
+        match.setRank(athleteProfile.currentRank());
+        match.setSuggestedSponsor(sponsorProfile.name());
+        match.setSponsorLogoUrl(sponsorProfile.logoUrl());
+        if (existingMatch == null) {
+            match.setStatus(MatchStatus.PROPOSED);
         }
-
-        if (preferences.getMinFINAPoints() != null && athlete.finaPoints() != null && athlete.finaPoints() < preferences.getMinFINAPoints()) {
-            return false;
+        
+        match.setMatchScore(aiResponse.matchScore());
+        match.setVerdict(aiResponse.verdict());
+        match.setConfidence(aiResponse.confidence());
+        match.setReason(aiResponse.explanation());
+        try {
+            match.setStrengthsJson(objectMapper.writeValueAsString(aiResponse.strengths()));
+            match.setWeaknessesJson(objectMapper.writeValueAsString(aiResponse.weaknesses()));
+            match.setPotentialRoiText(objectMapper.writeValueAsString(aiResponse.potentialROI()));
+            match.setAudienceOverlapText(objectMapper.writeValueAsString(aiResponse.audienceOverlap()));
+            match.setKeyFactorsJson(objectMapper.writeValueAsString(aiResponse.keyFactors()));
+        } catch (JsonProcessingException e) {
+            log.error("Error serializing match evaluation to JSON", e);
         }
+        match.setEvaluationDate(LocalDateTime.now());
+        
+        match = matchRepository.save(match);
+        return mapToResponseDTO(match);
+    }
 
-        return true;
+    private MatchEvaluationResponseDTO mapToResponseDTO(AthleteMatch m) {
+        return new MatchEvaluationResponseDTO(
+                m.getId(),
+                m.getSponsor() != null ? m.getSponsor().getId() : null,
+                m.getAthlete() != null ? m.getAthlete().getId() : null,
+                m.getAthleteName(),
+                m.getAthletePhotoUrl(),
+                m.getSuggestedSponsor(),
+                m.getSponsorLogoUrl(),
+                m.getMatchScore(),
+                m.getVerdict(),
+                m.getConfidence(),
+                m.getReason(),
+                parseStringList(m.getStrengthsJson()),
+                parseStringList(m.getWeaknessesJson()),
+                parseMap(m.getPotentialRoiText()),
+                parseMap(m.getAudienceOverlapText()),
+                parseMapList(m.getKeyFactorsJson()),
+                m.getEvaluationDate()
+        );
+    }
+
+    private List<String> parseStringList(String json) {
+        if (json == null || json.isBlank()) return List.of();
+        try {
+            return objectMapper.readValue(json, objectMapper.getTypeFactory().constructCollectionType(List.class, String.class));
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
+    private Map<String, Object> parseMap(String json) {
+        if (json == null || json.isBlank()) return Map.of();
+        try {
+            return objectMapper.readValue(json, objectMapper.getTypeFactory().constructMapType(Map.class, String.class, Object.class));
+        } catch (Exception e) {
+            return Map.of();
+        }
+    }
+
+    private List<Map<String, Object>> parseMapList(String json) {
+        if (json == null || json.isBlank()) return List.of();
+        try {
+            return objectMapper.readValue(json, objectMapper.getTypeFactory().constructCollectionType(List.class, Map.class));
+        } catch (Exception e) {
+            return List.of();
+        }
     }
 
     private List<AthleteProfile> buildAthleteProfiles() {
@@ -233,9 +285,7 @@ public class SmartMatchingService {
     }
 
     private String inferDiscipline(List<CompetitionResult> results) {
-        if (results.isEmpty()) {
-            return null;
-        }
+        if (results.isEmpty()) return null;
         return results.get(0).getEventName();
     }
 
@@ -246,18 +296,12 @@ public class SmartMatchingService {
             results.stream().limit(3).map(CompetitionResult::getPoints).filter(Objects::nonNull).forEach(points::add);
         }
 
-        if (points.size() < 2) {
-            return "stable";
-        }
+        if (points.size() < 2) return "stable";
 
         int latest = points.get(0);
         int previous = points.get(1);
-        if (latest > previous + 10) {
-            return "improving";
-        }
-        if (latest < previous - 10) {
-            return "declining";
-        }
+        if (latest > previous + 10) return "improving";
+        if (latest < previous - 10) return "declining";
         return "stable";
     }
 
@@ -299,23 +343,27 @@ public class SmartMatchingService {
         );
     }
 
-    private AiMatchResponse generateAiMatch(AthleteProfile athleteProfile, SponsorProfile sponsorProfile) {
+    private AiMatchResponse generateAiMatch(AthleteProfile athleteProfile, SponsorProfile sponsorProfile, SponsorPreferences preferences, int ruleScore) {
         try {
-            Map<String, Object> userPayload = new LinkedHashMap<>();
-            userPayload.put("athlete", athleteProfile);
-            userPayload.put("sponsor", sponsorProfile);
+            log.debug("Preparing Groq API request for model: {}, Athlete: {}, Sponsor: {}", model, athleteProfile.name(), sponsorProfile.name());
 
-            Map<String, Object> systemMessage = Map.of("role", "system", "content", SYSTEM_PROMPT);
+            String prompt = String.format(SYSTEM_PROMPT, 
+                    objectMapper.writeValueAsString(athleteProfile), 
+                    objectMapper.writeValueAsString(sponsorProfile), 
+                    preferences != null ? objectMapper.writeValueAsString(preferences) : "{}",
+                    ruleScore);
+
+            Map<String, Object> systemMessage = Map.of("role", "system", "content", prompt);
             Map<String, Object> userMessage = Map.of(
                     "role", "user",
-                    "content", "ATHLETE PROFILE:\n" + objectMapper.writeValueAsString(athleteProfile) + "\nSPONSOR PROFILE:\n" + objectMapper.writeValueAsString(sponsorProfile) + "\nRespond ONLY with JSON."
+                    "content", "Analyze this match and return the JSON evaluation."
             );
 
             Map<String, Object> requestBody = new LinkedHashMap<>();
             requestBody.put("model", model);
             requestBody.put("messages", List.of(systemMessage, userMessage));
             requestBody.put("temperature", 0.2);
-            requestBody.put("max_tokens", 300);
+            requestBody.put("max_tokens", 500);
 
             JsonNode response = groqClient.post()
                     .uri("/chat/completions")
@@ -323,6 +371,9 @@ public class SmartMatchingService {
                     .contentType(MediaType.APPLICATION_JSON)
                     .bodyValue(requestBody)
                     .retrieve()
+                    .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
+                            clientResponse -> clientResponse.bodyToMono(String.class)
+                                    .flatMap(errorBody -> reactor.core.publisher.Mono.error(new RuntimeException("API Error: " + clientResponse.statusCode() + ", Body: " + errorBody))))
                     .bodyToMono(JsonNode.class)
                     .block(Duration.ofSeconds(30));
 
@@ -331,26 +382,64 @@ public class SmartMatchingService {
             }
 
             String content = response.path("choices").path(0).path("message").path("content").asText();
-            return parseAiResponse(content);
+            return parseAiResponse(content, ruleScore);
         } catch (Exception ex) {
-            log.warn("Groq matching request failed for athlete {} and sponsor {}", athleteProfile.name(), sponsorProfile.name(), ex);
+            log.error("Groq matching request failed for athlete {} and sponsor {}", athleteProfile.name(), sponsorProfile.name(), ex);
             return null;
         }
     }
 
-    private AiMatchResponse parseAiResponse(String content) {
+    private AiMatchResponse parseAiResponse(String content, int ruleScore) {
         try {
             String json = extractJson(content);
             JsonNode node = objectMapper.readTree(json);
-            List<String> keyFactors = new ArrayList<>();
-            if (node.has("keyFactors") && node.get("keyFactors").isArray()) {
-                node.get("keyFactors").forEach(item -> keyFactors.add(item.asText()));
+            
+            List<String> strengths = new ArrayList<>();
+            if (node.has("strengths") && node.get("strengths").isArray()) {
+                node.get("strengths").forEach(item -> strengths.add(item.asText()));
             }
+            
+            List<String> weaknesses = new ArrayList<>();
+            if (node.has("weaknesses") && node.get("weaknesses").isArray()) {
+                node.get("weaknesses").forEach(item -> weaknesses.add(item.asText()));
+            }
+
+            Map<String, Object> potentialROI = new java.util.HashMap<>();
+            if (node.has("potentialROI") && node.get("potentialROI").isObject()) {
+                potentialROI = objectMapper.convertValue(node.get("potentialROI"), Map.class);
+            }
+            if (!potentialROI.containsKey("projectedValue")) {
+                potentialROI.put("projectedValue", 0);
+                potentialROI.put("currency", "TND");
+                potentialROI.put("explanation", "ROI calculation unavailable from AI model.");
+            }
+            
+            Map<String, Object> audienceOverlap = new java.util.HashMap<>();
+            if (node.has("audienceOverlap") && node.get("audienceOverlap").isObject()) {
+                audienceOverlap = objectMapper.convertValue(node.get("audienceOverlap"), Map.class);
+            }
+            if (!audienceOverlap.containsKey("score")) {
+                audienceOverlap.put("score", 0);
+                audienceOverlap.put("explanation", "Audience overlap score unavailable from AI model.");
+            }
+            
+            List<Map<String, Object>> keyFactors = new ArrayList<>();
+            if (node.has("keyFactors") && node.get("keyFactors").isArray()) {
+                for (JsonNode factorNode : node.get("keyFactors")) {
+                    keyFactors.add(objectMapper.convertValue(factorNode, Map.class));
+                }
+            }
+            
             return new AiMatchResponse(
-                    clampScore(node.path("matchScore").asInt(0)),
-                    node.path("reason").asText("Compatibility is based on ranking, discipline fit, and sponsor needs."),
+                    clampScore(node.path("matchScore").asInt(ruleScore)),
+                    node.path("verdict").asText("Moderate Fit"),
                     node.path("confidence").asText("MEDIUM"),
-                    keyFactors.isEmpty() ? List.of("discipline fit", "performance trend", "sponsor budget") : keyFactors
+                    node.path("explanation").asText("Compatibility is based on ranking, discipline fit, and sponsor needs."),
+                    strengths,
+                    weaknesses,
+                    potentialROI,
+                    audienceOverlap,
+                    keyFactors
             );
         } catch (Exception ex) {
             log.warn("Failed to parse Groq response: {}", content, ex);
@@ -359,9 +448,7 @@ public class SmartMatchingService {
     }
 
     private String extractJson(String content) {
-        if (content == null || content.isBlank()) {
-            return "{}";
-        }
+        if (content == null || content.isBlank()) return "{}";
         int start = content.indexOf('{');
         int end = content.lastIndexOf('}');
         if (start >= 0 && end > start) {
@@ -370,29 +457,77 @@ public class SmartMatchingService {
         return content;
     }
 
-    private AiMatchResponse buildFallbackResponse(CandidateMatch candidate, SponsorProfile sponsorProfile) {
-        int score = candidate.ruleScore();
-        List<String> factors = new ArrayList<>();
-        if (candidate.athleteProfile().discipline() != null && sponsorProfile.preferredDisciplines().stream().anyMatch(d -> d.equalsIgnoreCase(candidate.athleteProfile().discipline()))) {
-            factors.add("discipline alignment");
-        }
-        if (candidate.athleteProfile().performanceTrend() != null) {
-            factors.add("performance trend is " + candidate.athleteProfile().performanceTrend());
-        }
-        if (candidate.athleteProfile().licenseStatus() != null) {
-            factors.add("license status " + candidate.athleteProfile().licenseStatus());
-        }
-        if (factors.isEmpty()) {
-            factors.add("overall profile compatibility");
-        }
+    private AiMatchResponse buildFallbackResponse(int score, AthleteProfile athlete, SponsorProfile sponsorProfile) {
+        int disciplineAlignment = athlete.discipline() != null && sponsorProfile.preferredDisciplines().stream().anyMatch(d -> d.equalsIgnoreCase(athlete.discipline())) ? 95 : 55;
+        int performanceTrend = switch (Objects.toString(athlete.performanceTrend(), "stable").toLowerCase()) {
+            case "improving" -> 88;
+            case "declining" -> 45;
+            default -> 68;
+        };
+
+        int brandImageFit = Math.max(40, Math.min(95, (athlete.finaPoints() != null ? athlete.finaPoints() / 12 : 55)));
+        int geographicRelevance = (sponsorProfile.geographicPreference() != null && athlete.clubAffiliation() != null
+            && athlete.clubAffiliation().toLowerCase().contains(sponsorProfile.geographicPreference().toLowerCase())) ? 85 : 60;
+        int socialMediaReach = Math.max(35, Math.min(90, (athlete.finaPoints() != null ? athlete.finaPoints() / 14 : 50)));
+
+        long podiumCount = athlete.recentResults() == null ? 0 : athlete.recentResults().stream()
+            .filter(r -> r.rankPosition() != null && r.rankPosition() <= 3)
+            .count();
+        int historicalSuccess = (int) Math.max(30, Math.min(95, 40 + podiumCount * 15));
+
+        double visibilityMultiplier = 1.0 + (Math.max(0, performanceTrend - 50) / 100.0);
+        double sponsorValue = sponsorProfile.budget() != null ? sponsorProfile.budget() : 0.0;
+        double projectedValue = ((podiumCount > 0 ? podiumCount : 1) * sponsorValue * visibilityMultiplier) / 100.0;
+
+        int audienceScore = Math.max(20, Math.min(95, (disciplineAlignment + geographicRelevance + socialMediaReach) / 3));
+
+        String explanation = String.format(
+            "Algorithmic evaluation indicates a %s fit with strong discipline alignment (%d/100) and performance trend (%d/100). Estimated ROI is based on recent podium performance and sponsor value.",
+            score >= 90 ? "high" : score >= 75 ? "moderate" : "developing",
+            disciplineAlignment,
+            performanceTrend
+        );
+
+        List<String> strengths = new ArrayList<>();
+        if (disciplineAlignment >= 80) strengths.add("Strong discipline alignment with sponsor priorities.");
+        if (performanceTrend >= 75) strengths.add("Recent performances indicate upward momentum.");
+        if (historicalSuccess >= 70) strengths.add("Competition history supports visibility and conversion potential.");
+        if (strengths.isEmpty()) strengths.add("Foundational compatibility with room to improve via targeted activation.");
+
+        List<String> weaknesses = new ArrayList<>();
+        if (geographicRelevance < 65) weaknesses.add("Geographic relevance is moderate for current sponsor market focus.");
+        if (socialMediaReach < 60) weaknesses.add("Digital reach indicators are limited compared to top performers.");
+        if (weaknesses.isEmpty()) weaknesses.add("No critical weaknesses detected in the current data snapshot.");
+
+        String verdict = score >= 90 ? "Strong Fit" : score >= 75 ? "Moderate Fit" : "Emerging Fit";
+        String confidence = score >= 90 ? "HIGH" : score >= 75 ? "MEDIUM" : "LOW";
+
+        List<Map<String, Object>> factors = List.of(
+            Map.of("name", "Discipline Alignment", "score", disciplineAlignment, "weight", 0.24),
+            Map.of("name", "Performance Trend", "score", performanceTrend, "weight", 0.20),
+            Map.of("name", "Brand Image Fit", "score", brandImageFit, "weight", 0.16),
+            Map.of("name", "Geographic Relevance", "score", geographicRelevance, "weight", 0.12),
+            Map.of("name", "Social Media Reach", "score", socialMediaReach, "weight", 0.12),
+            Map.of("name", "Historical Success", "score", historicalSuccess, "weight", 0.16)
+        );
 
         return new AiMatchResponse(
-                score,
-                score >= 75
-                        ? "The athlete aligns well with the sponsor's discipline and performance expectations. The brand fit is strong and the athlete has a competitive profile."
-                        : "The fit is moderate and may need stronger discipline or performance alignment before outreach.",
-                score >= 90 ? "HIGH" : score >= 75 ? "MEDIUM" : "LOW",
-                factors.stream().distinct().limit(3).toList()
+            score,
+            verdict,
+            confidence,
+            explanation,
+            strengths,
+            weaknesses,
+            Map.of(
+                "projectedValue", Math.round(projectedValue),
+                "currency", "TND",
+                "explanation", "Potential ROI computed from podium history, sponsor value, and visibility multiplier."
+            ),
+            Map.of(
+                "score", audienceScore,
+                "explanation", "Audience overlap combines discipline alignment, geographic relevance, and digital reach."
+            ),
+            factors
         );
     }
 
@@ -445,96 +580,13 @@ public class SmartMatchingService {
         return clampScore(score);
     }
 
-    private AthleteMatch buildMatchEntity(AthleteProfile athleteProfile, SponsorProfile sponsorProfile, AiMatchResponse aiResponse) {
-        try {
-            return AthleteMatch.builder()
-                    .athlete(athleteRepository.findById(athleteProfile.id()).orElse(null))
-                    .sponsor(sponsorRepository.findById(sponsorProfile.id()).orElse(null))
-                    .athleteName(athleteProfile.name())
-                    .athletePhotoUrl(athleteProfile.photoUrl())
-                    .discipline(athleteProfile.discipline())
-                    .rank(athleteProfile.currentRank())
-                    .suggestedSponsor(sponsorProfile.name())
-                    .sponsorLogoUrl(sponsorProfile.logoUrl())
-                    .matchScore(aiResponse.matchScore())
-                    .confidence(aiResponse.confidence())
-                    .reason(aiResponse.reason())
-                    .keyFactorsJson(objectMapper.writeValueAsString(aiResponse.keyFactors()))
-                    .status(MatchStatus.PROPOSED)
-                    .build();
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("Failed to serialize match factors", e);
-        }
-    }
-
-    @Transactional
-    protected void archiveProposedMatches() {
-        matchRepository.findByStatus(MatchStatus.PROPOSED).forEach(match -> {
-            match.setStatus(MatchStatus.DISMISSED);
-            matchRepository.save(match);
-        });
-    }
-
-    @Transactional
-    protected void archiveProposedMatchesForSponsors(List<Sponsor> sponsors) {
-        Set<Long> sponsorIds = sponsors.stream().map(Sponsor::getId).collect(Collectors.toSet());
-        matchRepository.findByStatus(MatchStatus.PROPOSED).stream()
-                .filter(match -> match.getSponsor() != null && sponsorIds.contains(match.getSponsor().getId()))
-                .forEach(match -> {
-                    match.setStatus(MatchStatus.DISMISSED);
-                    matchRepository.save(match);
-                });
-    }
-
-    private void ensureGenerationAllowed(Long sponsorId) {
-        Instant now = Instant.now();
-        Instant lastGeneration = sponsorGenerationTimestamps.get(sponsorId);
-        if (lastGeneration != null && Duration.between(lastGeneration, now).compareTo(RATE_LIMIT_WINDOW) < 0) {
-            throw new RateLimitExceededException("Matching generation is limited to once per minute for each sponsor.");
-        }
-        sponsorGenerationTimestamps.put(sponsorId, now);
-    }
-
-    private AthleteMatchDTO mapToDTO(AthleteMatch match) {
-        return new AthleteMatchDTO(
-                match.getId(),
-                match.getAthlete() != null ? match.getAthlete().getId() : null,
-                match.getSponsor() != null ? match.getSponsor().getId() : null,
-                match.getAthleteName(),
-                match.getAthletePhotoUrl(),
-                match.getDiscipline(),
-                match.getRank(),
-                match.getSuggestedSponsor(),
-                match.getSponsorLogoUrl(),
-                match.getMatchScore(),
-                match.getScoreColor(),
-                match.getConfidence(),
-                match.getReason(),
-                parseKeyFactors(match.getKeyFactorsJson()),
-                match.getStatus() != null ? match.getStatus().name() : null
-        );
-    }
-
-    private List<String> parseKeyFactors(String keyFactorsJson) {
-        if (keyFactorsJson == null || keyFactorsJson.isBlank()) {
-            return List.of();
-        }
-        try {
-            return objectMapper.readValue(keyFactorsJson, objectMapper.getTypeFactory().constructCollectionType(List.class, String.class));
-        } catch (JsonProcessingException e) {
-            return List.of(keyFactorsJson);
-        }
-    }
-
     private int clampScore(int score) {
         return Math.max(0, Math.min(100, score));
     }
 
-    private record CandidateMatch(AthleteProfile athleteProfile, int ruleScore) {}
+    public record ResultSummary(String eventName, String recordTime, Integer rankPosition, Integer points) {}
 
-    private record ResultSummary(String eventName, String recordTime, Integer rankPosition, Integer points) {}
-
-    private record AthleteProfile(
+    public record AthleteProfile(
             Long id,
             String name,
             Integer age,
@@ -569,5 +621,14 @@ public class SmartMatchingService {
             String logoUrl
     ) {}
 
-    private record AiMatchResponse(Integer matchScore, String reason, String confidence, List<String> keyFactors) {}
+    private record AiMatchResponse(
+            Integer matchScore, 
+            String verdict, 
+            String confidence, 
+            String explanation, 
+            List<String> strengths, 
+            List<String> weaknesses, 
+            Map<String, Object> potentialROI, 
+            Map<String, Object> audienceOverlap, 
+            List<Map<String, Object>> keyFactors) {}
 }

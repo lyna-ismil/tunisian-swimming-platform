@@ -1,8 +1,10 @@
 spring:
+  profiles:
+    active: dev
   application:
     name: ftn-platform-backend
   datasource:
-    url: jdbc:mysql://localhost:3306/ftn_platform?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    url: jdbc:mysql://localhost:3306/ftn_platform?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
     username: root
     password: 250190Lina!
   jpa:
@@ -13,10 +15,20 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.MySQL8Dialect
         format_sql: true
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+  jackson:
+    default-property-inclusion: non_null
+
+app:
+  upload:
+    dir: ./uploads
 
 groq:
   api:
-    key: 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
+    key: {GROQ_API_KEY:}
     url: https://api.groq.com/openai/v1
     model: llama-3.3-70b-versatile
   system-prompt: >
@@ -98,3 +110,9 @@ groq:
 
 server:
   port: 8080
+
+ml:
+  service:
+    base-url: http://localhost:8000
+    timeout: 10000
+    max-in-memory-size: 16777216

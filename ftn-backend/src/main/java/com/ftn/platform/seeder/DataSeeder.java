@@ -31,6 +31,7 @@ public class DataSeeder implements CommandLineRunner {
     private final SuggestionRepository suggestionRepository;
     private final SystemPromptRepository systemPromptRepository;
     private final ChatConfigRepository chatConfigRepository;
+    private final UserRepository userRepository;
 
     @Override
     public void run(String... args) throws Exception {
@@ -47,11 +48,6 @@ public class DataSeeder implements CommandLineRunner {
         if (requestRepository.count() == 0) {
             log.info("Seeding Sponsorship Requests...");
             seedRequests();
-        }
-        
-        if (matchRepository.count() == 0) {
-            log.info("Seeding Athlete Matches...");
-            seedMatches();
         }
         
         if (eventRepository.count() == 0) {
@@ -79,6 +75,15 @@ public class DataSeeder implements CommandLineRunner {
             chatConfigRepository.save(ChatConfig.builder()
                 .configKey("welcome_message")
                 .configValue("Hello! I am the FTN AI Assistant. I can help you with competition rules, athlete profiles, administrative procedures, or navigating the platform. How can I assist you today?")
+                .build());
+        }
+
+        if (userRepository.count() == 0) {
+            log.info("Seeding Admin User...");
+            userRepository.save(User.builder()
+                .username("admin")
+                .password(org.mindrot.jbcrypt.BCrypt.hashpw("adminpassword", org.mindrot.jbcrypt.BCrypt.gensalt()))
+                .role("ADMIN")
                 .build());
         }
 
@@ -220,10 +225,6 @@ public class DataSeeder implements CommandLineRunner {
                                 sponsorPreferencesRepository.save(preferences);
                         });
                 });
-
-                if (matchRepository.count() == 0 && athleteRepository.count() > 0) {
-                        smartMatchingService.generateMatches(new com.ftn.platform.dto.MatchGenerationRequestDTO(null, 3, true));
-                }
         }
 
         private List<String> parseDisciplines(String json) {
@@ -286,40 +287,6 @@ public class DataSeeder implements CommandLineRunner {
                 .build();
 
         requestRepository.saveAll(List.of(r1, r2, r3, r4));
-    }
-
-    private void seedMatches() {
-        AthleteMatch m1 = AthleteMatch.builder()
-                .athleteName("Ahmed Hafnaoui")
-                .discipline("Freestyle Distance")
-                .rank(1)
-                .suggestedSponsor("Speedo")
-                .matchScore(95)
-                .reason("Top performer in freestyle, aligns perfectly with Speedo performance brand goals.")
-                .status(MatchStatus.PROPOSED)
-                .build();
-
-        AthleteMatch m2 = AthleteMatch.builder()
-                .athleteName("Rami Chammari")
-                .discipline("Butterfly")
-                .rank(5)
-                .suggestedSponsor("Arena")
-                .matchScore(82)
-                .reason("Rising star in butterfly events. Arena is looking to sponsor junior talent.")
-                .status(MatchStatus.PROPOSED)
-                .build();
-
-        AthleteMatch m3 = AthleteMatch.builder()
-                .athleteName("Sarra Lajnef")
-                .discipline("Breaststroke")
-                .rank(2)
-                .suggestedSponsor("Ooredoo Tunisia")
-                .matchScore(78)
-                .reason("Strong local presence and high engagement on social media.")
-                .status(MatchStatus.PROPOSED)
-                .build();
-
-        matchRepository.saveAll(List.of(m1, m2, m3));
     }
 
     private void seedEvents() {
