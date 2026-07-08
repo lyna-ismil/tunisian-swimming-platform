@@ -1,1 +1,0 @@
-"use strict";(self.webpackChunkftn_dashboard=self.webpackChunkftn_dashboard||[]).push([[199],{8199:(t,o,n)=>{n.r(o),n.d(o,{SPONSORS_ROUTES:()=>s});const s=[{path:"",loadComponent:()=>Promise.all([n.e(416),n.e(724),n.e(354),n.e(76),n.e(693)]).then(n.bind(n,1693)).then(d=>d.SponsorsComponent)}]}}]);
